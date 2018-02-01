@@ -17,6 +17,8 @@ static const int CONCURRENCY = 8;
 static const double BLOCK_TIME = 60;
 static const int DIFFICULTY_BLOCK_WINDOW = 120;
 static const double DIFFICULTY_MAX_ADJUSTMENT_FACTOR = 2;
+static const int COMPACT_MAX = 0x1f00ffff;
+static const double DIFFICULTY_MAX = (COMPACT_MAX & 0xffffff) * pow(2, (8 * ((COMPACT_MAX >> 24) - 3)));
 static const double TOTAL_SUPPLY = 21e14;
 static const double INITIAL_SUPPLY = 252e12;
 static const double EMISSION_SPEED = pow(2, 22);
@@ -114,8 +116,12 @@ double CalculateNewDifficulty(double time, Block* prev) {
 
     // Compute the next target.
     double averageDifficulty = deltaTotalDifficulty / DIFFICULTY_BLOCK_WINDOW;
+    double newDifficulty = averageDifficulty * adjustment;
+
+    newDifficulty = std::max(newDifficulty, 1.);
+    newDifficulty = std::min(newDifficulty, DIFFICULTY_MAX);
     
-    return averageDifficulty * adjustment;
+    return newDifficulty;
 }
 
 double CalculateBlockRewardAt(double currentSupply, int height) {
