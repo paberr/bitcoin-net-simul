@@ -13,11 +13,15 @@ struct Miner;
 /** How many computation threads to use. */
 static const int CONCURRENCY = 8;
 
-/** Bitcoin constants. */
-static const double RETARGET_TIME = 14 * 24 * 60 * 60;
-static const int RETARGET_BLOCKS = 2016;
-static const double INTERVAL_TIME = RETARGET_TIME / RETARGET_BLOCKS;
-static const int SUBSIDY = 25;
+/** Nimiq constants. */
+static const double BLOCK_TIME = 60;
+static const int DIFFICULTY_BLOCK_WINDOW = 120;
+static const double DIFFICULTY_MAX_ADJUSTMENT_FACTOR = 2;
+static const double TOTAL_SUPPLY = 21e14;
+static const double INITIAL_SUPPLY = 252e12;
+static const double EMISSION_SPEED = pow(2, 22);
+static const int EMISSION_TAIL_START = 48692960;
+static const int EMISSION_TAIL_REWARD = 4000;
 
 /** Helper functions for block skiplist. */
 int static inline InvertLowestOne(int n) { return n & (n - 1); }
@@ -30,6 +34,8 @@ int static inline GetSkipHeight(int height) {
 struct Block;
 
 double CalculateNewDifficulty(double time, Block* prev);
+double CalculateBlockRewardAt(double currentSupply, int height);
+double CalculateSupplyAfter(int height);
 
 /** Block structure. */
 struct Block {
@@ -42,6 +48,7 @@ struct Block {
     const double difficulty;
     const double work;
     const double value;
+    const double currentSupply;
 
 private:
 
@@ -71,32 +78,63 @@ public:
     }
 
     /** Construct a non-genesis block. */
-    Block(int size_, double time_, Block* prev_, int owner_, double value_)
+    Block(int size_, double time_, Block* prev_, int owner_, double fees_, double reward_)
         : size(size_), owner(owner_), prev(prev_), height(prev->height + 1),
           skip(prev->GetAncestor(GetSkipHeight(height))),
           time(time_), difficulty(CalculateNewDifficulty(time_, prev_)),
-          work(prev->work + prev->difficulty), value(value_) {}
+          work(prev->work + prev->difficulty), value(fees_ + reward_),
+          currentSupply(prev->currentSupply + reward_) {}
 
     /* Construct a genesis block. */
     Block(double diff)
-        : size(0), owner(-1), prev(NULL), height(0), skip(NULL), time(0), difficulty(diff), work(0), value(0) {}
+        : size(0), owner(-1), prev(NULL), height(1), skip(NULL), time(0), difficulty(diff), work(0), value(0), currentSupply(INITIAL_SUPPLY + CalculateBlockRewardAt(1, INITIAL_SUPPLY)) {}
 };
 
 double CalculateNewDifficulty(double time, Block* prev) {
     if (prev == NULL) return 1.0;
-    if ((prev->height + 1) % RETARGET_BLOCKS != 0) {
-        return prev->difficulty;
+
+    Block* first = prev->GetAncestor(std::max(prev->height + 1 - DIFFICULTY_BLOCK_WINDOW, 1));
+    double actualTime = prev->time - first->time;
+    double deltaTotalDifficulty = (prev->work + prev->difficulty) - (first->work + first->difficulty);
+
+    // Simulate that the BLOCK_TIME was achieved for the blocks before the genesis block, i.e. we simulate
+    // a sliding window that starts before the genesis block. Assume difficulty = 1 for these blocks.
+    if (prev->height <= DIFFICULTY_BLOCK_WINDOW) {
+        actualTime += (DIFFICULTY_BLOCK_WINDOW - prev->height + 1) * BLOCK_TIME;
+        deltaTotalDifficulty += DIFFICULTY_BLOCK_WINDOW - prev->height + 1;
     }
-    Block* first = prev->GetAncestor(std::max(prev->height + 1 - RETARGET_BLOCKS, 0));
-    double timespan = prev->time - first->time;
-    if (timespan < RETARGET_TIME * 0.25)
-        timespan = RETARGET_TIME * 0.25;
-    if (timespan > RETARGET_TIME * 4.0)
-        timespan = RETARGET_TIME * 4.0;
-    double newdiff = prev->difficulty * RETARGET_TIME / timespan;
-    if (newdiff < 1.0)
-        newdiff = 1.0;
-    return newdiff;
+
+    // Compute the target adjustment factor.
+    double expectedTime = DIFFICULTY_BLOCK_WINDOW * BLOCK_TIME;
+    double adjustment = expectedTime / actualTime;
+
+    // Clamp the adjustment factor to [1 / MAX_ADJUSTMENT_FACTOR, MAX_ADJUSTMENT_FACTOR].
+    adjustment = std::max(adjustment, 1 / DIFFICULTY_MAX_ADJUSTMENT_FACTOR);
+    adjustment = std::min(adjustment, DIFFICULTY_MAX_ADJUSTMENT_FACTOR);
+
+    // Compute the next target.
+    double averageDifficulty = deltaTotalDifficulty / DIFFICULTY_BLOCK_WINDOW;
+    
+    return averageDifficulty * adjustment;
+}
+
+double CalculateBlockRewardAt(double currentSupply, int height) {
+    if (height <= 0)
+        return 0;
+    double remaining = TOTAL_SUPPLY - currentSupply;
+    if (height >= EMISSION_TAIL_START && remaining >= EMISSION_TAIL_REWARD) {
+        return EMISSION_TAIL_REWARD;
+    }
+    double remainder = fmod(remaining, EMISSION_SPEED);
+    return (remaining - remainder) / EMISSION_SPEED;
+}
+
+double CalculateSupplyAfter(int height) {
+    double supply = INITIAL_SUPPLY;
+    for (int i = 0; i <= height; ++i) {
+        supply += CalculateBlockRewardAt(supply, i);
+    }
+    return supply;
 }
 
 struct Simulation;
@@ -191,7 +229,7 @@ struct Simulation {
 
     /** Mine a new block. */
     Block* CreateBlock(int size, double time, Block* prev, int owner) {
-        blocks.push_back(std::unique_ptr<Block>(new Block(size, time, prev, owner, SUBSIDY + fee_per_byte * size)));
+        blocks.push_back(std::unique_ptr<Block>(new Block(size, time, prev, owner, fee_per_byte * size, CalculateBlockRewardAt(prev->currentSupply, prev->height + 1))));
         Block* block = blocks.back().get();
 
         if (block->work > best_block->work) {
@@ -252,7 +290,7 @@ public:
         if (ret.second) {
             simul->AddEvent(time + delay + delay_per_byte * block->size, this, EVENT_TYPE_PROCESSED_BLOCK, block);
         }
-        std::pair<const Node*,Block*> oldknown(this, block->GetAncestor(block->height - RETARGET_TIME));
+        std::pair<const Node*,Block*> oldknown(this, block->GetAncestor(block->height - DIFFICULTY_BLOCK_WINDOW * 2));
         simul->block_known.erase(oldknown);
     }
 
@@ -326,7 +364,7 @@ public:
     void ScheduleBlockMine(double time, Simulation* simul) const {
         long double uniform = (random() + 0.5l) / (((long double)RAND_MAX) + 1);
         /* -log(U) / delta produces values with exponential distibution, modelling the times between events in a Poisson process with rate delta. */
-        simul->AddEvent(time + mining_delay - logl(uniform) * INTERVAL_TIME * simul->block_best[this]->difficulty / hashrate, this, EVENT_TYPE_MINED, simul->block_best[this]);
+        simul->AddEvent(time + mining_delay - logl(uniform) * BLOCK_TIME * simul->block_best[this]->difficulty / hashrate, this, EVENT_TYPE_MINED, simul->block_best[this]);
     }
 
     void ProcessedBlock(double time, Block* block, Simulation* simul) const {
@@ -481,9 +519,9 @@ void TryBlockSize(int size_a, int size_b, double total_fees_per_block) {
 }
 
 int main(void) {
-    double fees_per_block[] = {0.25, 25};
-    int sizes_a[] = {20000000};
-    int sizes_b[] = {1000000, 20000000};
+    double fees_per_block[] = {250, 2500};
+    int sizes_a[] = {1000000};
+    int sizes_b[] = {500000, 1000000};
     for (double fee_per_block : fees_per_block) {
         for (int size_a : sizes_a) {
             for (int size_b : sizes_b) {
